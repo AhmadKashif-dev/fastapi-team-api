@@ -14,3 +14,17 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Import models to register them with Base.metadata
+from app.models import (  # noqa: E402, F401
+    User,
+    Organization,
+    Membership,
+    Role,
+    Permission,
+    RolePermission,
+    RefreshToken,
+    PasswordResetToken,
+    Invitation,
+)
