@@ -12,6 +12,7 @@ class OrgRead(BaseModel):
     id: UUID
     name: str
     owner_id: UUID
+    created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -34,9 +35,11 @@ class MemberReadWithUser(BaseModel):
     id: UUID
     user_id: UUID
     role_id: UUID
+    role_name: str | None = None
     status: str
     email: str
     full_name: str | None
+    joined_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

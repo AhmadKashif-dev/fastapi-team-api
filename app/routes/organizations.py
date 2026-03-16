@@ -2,13 +2,15 @@ import secrets
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user, get_membership, require_permission
 from app.auth.hashing import hash_token
 from app.database import get_db
 from app.models import Invitation, Membership, MembershipStatus, Organization, Role, User
+from app.schemas.common import PaginatedResponse
 from app.schemas.organization import (
     InvitationCreate,
     InvitationRead,
@@ -56,15 +58,40 @@ def create_organization(
     return org
 
 
-@router.get("", response_model=list[OrgRead])
+@router.get("", response_model=PaginatedResponse[OrgRead])
 def list_organizations(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    search: str | None = Query(None, description="Search by organization name"),
+    sort_by: str = Query("name", description="Sort by: name, created_at"),
+    sort_order: str = Query("asc", description="Sort order: asc, desc"),
 ):
     memberships = db.query(Membership).filter(Membership.user_id == user.id).all()
     org_ids = [m.organization_id for m in memberships]
-    orgs = db.query(Organization).filter(Organization.id.in_(org_ids)).all()
-    return orgs
+    q = db.query(Organization).filter(Organization.id.in_(org_ids))
+
+    if search:
+        q = q.filter(Organization.name.ilike(f"%{search}%"))
+
+    sort_col = Organization.name if sort_by == "name" else Organization.created_at
+    if sort_order == "desc":
+        q = q.order_by(sort_col.desc())
+    else:
+        q = q.order_by(sort_col.asc())
+
+    total = q.count()
+    orgs = q.offset((page - 1) * limit).limit(limit).all()
+    pages = (total + limit - 1) // limit if total > 0 else 1
+
+    return PaginatedResponse(
+        items=orgs,
+        total=total,
+        page=page,
+        limit=limit,
+        pages=pages,
+    )
 
 
 @router.get("/{org_id}", response_model=OrgRead)
@@ -121,20 +148,55 @@ def delete_organization(
     return {"message": "Organization deleted"}
 
 
-@router.get("/{org_id}/members", response_model=list[MemberReadWithUser])
+@router.get("/{org_id}/members", response_model=PaginatedResponse[MemberReadWithUser])
 def list_members(
     org_id: UUID,
     user: User = Depends(require_permission("member:read")),
     db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    search: str | None = Query(None, description="Search by full name or email"),
+    role_id: UUID | None = Query(None, description="Filter by role"),
+    sort_by: str = Query("full_name", description="Sort by: full_name, email, joined_at, role"),
+    sort_order: str = Query("asc", description="Sort order: asc, desc"),
 ):
-    memberships = (
+    q = (
         db.query(Membership)
+        .join(User, Membership.user_id == User.id)
+        .join(Role, Membership.role_id == Role.id)
         .filter(
             Membership.organization_id == org_id,
             Membership.status == MembershipStatus.ACCEPTED,
         )
-        .all()
     )
+
+    if search:
+        term = f"%{search}%"
+        q = q.filter(
+            or_(
+                User.full_name.ilike(term),
+                User.email.ilike(term),
+            )
+        )
+
+    if role_id:
+        q = q.filter(Membership.role_id == role_id)
+
+    sort_map = {
+        "full_name": User.full_name,
+        "email": User.email,
+        "joined_at": Membership.joined_at,
+        "role": Role.name,
+    }
+    sort_col = sort_map.get(sort_by, User.full_name)
+    if sort_order == "desc":
+        q = q.order_by(sort_col.desc().nullslast())
+    else:
+        q = q.order_by(sort_col.asc().nullsfirst())
+
+    total = q.count()
+    memberships = q.offset((page - 1) * limit).limit(limit).all()
+
     result = []
     for m in memberships:
         u = m.user
@@ -143,12 +205,22 @@ def list_members(
                 id=m.id,
                 user_id=m.user_id,
                 role_id=m.role_id,
+                role_name=m.role.name,
                 status=m.status.value,
                 email=u.email,
                 full_name=u.full_name,
+                joined_at=m.joined_at,
             )
         )
-    return result
+
+    pages = (total + limit - 1) // limit if total > 0 else 1
+    return PaginatedResponse(
+        items=result,
+        total=total,
+        page=page,
+        limit=limit,
+        pages=pages,
+    )
 
 
 @router.post("/{org_id}/invitations", response_model=InvitationRead)
@@ -191,21 +263,42 @@ def create_invitation(
     return inv
 
 
-@router.get("/{org_id}/invitations", response_model=list[InvitationRead])
+@router.get("/{org_id}/invitations", response_model=PaginatedResponse[InvitationRead])
 def list_invitations(
     org_id: UUID,
     user: User = Depends(require_permission("member:read")),
     db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    search: str | None = Query(None, description="Search by email"),
+    sort_by: str = Query("created_at", description="Sort by: email, created_at"),
+    sort_order: str = Query("desc", description="Sort order: asc, desc"),
 ):
-    invs = (
-        db.query(Invitation)
-        .filter(
-            Invitation.organization_id == org_id,
-            Invitation.accepted_at.is_(None),
-        )
-        .all()
+    q = db.query(Invitation).filter(
+        Invitation.organization_id == org_id,
+        Invitation.accepted_at.is_(None),
     )
-    return invs
+
+    if search:
+        q = q.filter(Invitation.email.ilike(f"%{search}%"))
+
+    sort_col = Invitation.email if sort_by == "email" else Invitation.created_at
+    if sort_order == "desc":
+        q = q.order_by(sort_col.desc())
+    else:
+        q = q.order_by(sort_col.asc())
+
+    total = q.count()
+    invs = q.offset((page - 1) * limit).limit(limit).all()
+    pages = (total + limit - 1) // limit if total > 0 else 1
+
+    return PaginatedResponse(
+        items=invs,
+        total=total,
+        page=page,
+        limit=limit,
+        pages=pages,
+    )
 
 
 @router.delete("/{org_id}/invitations/{inv_id}")
